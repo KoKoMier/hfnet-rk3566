@@ -8,7 +8,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # 开启 O3 极速优化与 NEON 指令集
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -march=armv8-a")
 
-
 # 设置相对路径指向已存在的 RKNN NPU 运行时 SDK
 set(RKNN_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rknn_model_zoo/3rdparty/rknpu2")
 set(RKNN_HEADER_DIR "${RKNN_SDK_DIR}/include")
@@ -16,19 +15,29 @@ set(RKNN_HEADER_DIR "${RKNN_SDK_DIR}/include")
 # 定位 Linux aarch64 平台对应的 librknnrt.so 动态链接库
 set(RKNN_LIB "${RKNN_SDK_DIR}/Linux/aarch64/librknnrt.so")
 
-# 定位已有的 stb_image 头文件搜索路径（提供 JPG/PNG 解码与缩放能力，且无外部动态库依赖）
+# 定位已有的 stb_image 头文件搜索路径
 set(STB_IMAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rknn_model_zoo/3rdparty/stb_image")
 set(STB_RESIZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rknn-toolkit2/rknpu2/examples/3rdparty/stb")
 
 # 添加头文件搜索路径
 include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${RKNN_HEADER_DIR}
     ${STB_IMAGE_DIR}
     ${STB_RESIZE_DIR}
 )
 
+# 收集源文件
+set(SOURCES
+    src/main.cpp
+    src/image_utils.cpp
+    src/hfnet_postprocess.cpp
+    src/rknn_engine.cpp
+    src/hfnet_pipeline.cpp
+)
+
 # 声明编译的可执行程序
-add_executable(hfnet_demo main.cpp)
+add_executable(hfnet_demo ${SOURCES})
 
 # 链接 RKNN 动态库
 target_link_libraries(hfnet_demo
@@ -37,4 +46,3 @@ target_link_libraries(hfnet_demo
     pthread
     m
 )
-
