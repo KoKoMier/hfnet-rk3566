@@ -13,6 +13,11 @@ struct PipelineConfig {
     std::string model_path;
     std::string input_path;
     std::string output_path = "./out4.nv12";
+    std::string imu_port = "/dev/ttyUSB0";
+    int imu_baud = 9600;
+    std::string calib_json = "./config/custom_stereo_imu.json";
+    std::string blackbox_dir = "./outputs/blackbox_logs";
+
     int cam_width = 640;
     int cam_height = 480;
     int num_workers = 2;
@@ -26,7 +31,7 @@ struct PipelineConfig {
     int grid_cols = 8;
 };
 
-// HF-Net 多线程三级并发流水线管理器
+// HF-Net + Visual-Inertial SLAM 多线程三级并发流水线管理器
 class HfnetPipeline {
 public:
     HfnetPipeline();
@@ -36,7 +41,8 @@ public:
     int run(const PipelineConfig& config);
 
 private:
-    void thread_preprocess(const PipelineConfig& config, int req_width, int req_height);
+    void thread_preprocess(const PipelineConfig& config, int req_width, int req_height,
+                           slam::WitMotionSerialImu* imu_reader);
     void thread_npu_worker(RknnWorker* worker, int req_width, int req_height);
     void thread_postprocess(const PipelineConfig& config, const RknnWorker* worker_meta);
 

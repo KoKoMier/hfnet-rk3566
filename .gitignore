@@ -24,3 +24,7 @@ Makefile
 *.swp
 *~
 .DS_Store
+
+# Generated streams and blackbox logs
+outputs/
+*.nv12
