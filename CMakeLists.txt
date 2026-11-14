@@ -19,12 +19,16 @@ set(RKNN_LIB "${RKNN_SDK_DIR}/Linux/aarch64/librknnrt.so")
 set(STB_IMAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rknn_model_zoo/3rdparty/stb_image")
 set(STB_RESIZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rknn-toolkit2/rknpu2/examples/3rdparty/stb")
 
+# 项目内置的 stb 头文件 (stb_image_resize.h)
+set(STB_LOCAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/stb")
+
 # 添加头文件搜索路径
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${RKNN_HEADER_DIR}
     ${STB_IMAGE_DIR}
     ${STB_RESIZE_DIR}
+    ${STB_LOCAL_DIR}
 )
 
 # 收集源文件 (HF-Net NPU 流水线 + 完整 C++ 视觉惯性 SLAM 前后端与黑盒记录仪)
