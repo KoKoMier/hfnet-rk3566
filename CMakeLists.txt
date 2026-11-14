@@ -5,12 +5,8 @@ project(hfnet_rknn_demo)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 开启 O3 极速优化与 ARMv8 NEON 指令集
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -march=armv8-a")
-else()
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math")
-endif()
+# 开启 O3 极速优化与 NEON 指令集
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -march=armv8-a")
 
 # 设置相对路径指向已存在的 RKNN NPU 运行时 SDK
 set(RKNN_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rknn_model_zoo/3rdparty/rknpu2")
