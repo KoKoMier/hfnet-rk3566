@@ -26,6 +26,18 @@ public:
         std::vector<Vec2>& out_prev_pts
     );
 
+    // 单目初始化阶段: 双向 4 层金字塔 LK 光流跟踪参考帧 F0 -> 当前帧 Fk (fb_err <= 1.5 px)
+    static void track_init_optical_flow(
+        const Frame& init_frame,
+        const std::vector<std::vector<uint8_t>>& curr_pyr,
+        const std::vector<int>& curr_pyr_w,
+        const std::vector<int>& curr_pyr_h,
+        const StereoCamera& camera,
+        std::vector<int>& out_matched_idx0,
+        std::vector<Vec2>& out_matched_pts0,
+        std::vector<Vec2>& out_matched_pts1
+    );
+
     // 256 维归一化 HF-Net 描述子余弦距离 (0.0 表示完全相同, 2.0 表示相反)
     static float descriptor_distance(const std::vector<float>& d1, const std::vector<float>& d2);
 

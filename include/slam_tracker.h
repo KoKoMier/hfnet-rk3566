@@ -51,6 +51,7 @@ public:
 
     ImuPreintegrator imu_preintegrator;
     ImuPreintegrator init_imu_preintegrator;
+    std::vector<Vec3> gyro_vec_hist_;
 
     bool last_is_keyframe = false;
     bool last_used_optical_flow = false;

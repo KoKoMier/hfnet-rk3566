@@ -247,6 +247,45 @@ void FrontendMatcher::track_optical_flow(
     }
 }
 
+void FrontendMatcher::track_init_optical_flow(
+    const Frame& init_frame,
+    const std::vector<std::vector<uint8_t>>& curr_pyr,
+    const std::vector<int>& curr_pyr_w,
+    const std::vector<int>& curr_pyr_h,
+    const StereoCamera& camera,
+    std::vector<int>& out_matched_idx0,
+    std::vector<Vec2>& out_matched_pts0,
+    std::vector<Vec2>& out_matched_pts1
+) {
+    out_matched_idx0.clear();
+    out_matched_pts0.clear();
+    out_matched_pts1.clear();
+    if (init_frame.pyramid_left.empty() || curr_pyr.empty()) return;
+
+    for (int i = 0; i < init_frame.num_kps; ++i) {
+        float u0 = (float)init_frame.kp_pts[i].x;
+        float v0 = (float)init_frame.kp_pts[i].y;
+        float u1 = u0;
+        float v1 = v0;
+
+        if (!track_single_point_lk(init_frame.pyramid_left, curr_pyr, curr_pyr_w, curr_pyr_h, u0, v0, u1, v1)) {
+            continue;
+        }
+
+        float u0_back = u0;
+        float v0_back = v0;
+        if (!track_single_point_lk(curr_pyr, init_frame.pyramid_left, curr_pyr_w, curr_pyr_h, u1, v1, u0_back, v0_back)) {
+            continue;
+        }
+        float fb_err2 = (u0_back - u0) * (u0_back - u0) + (v0_back - v0) * (v0_back - v0);
+        if (fb_err2 <= 2.25f && camera.is_in_image(u1, v1, 4.0)) {
+            out_matched_idx0.push_back(i);
+            out_matched_pts0.emplace_back(u0, v0);
+            out_matched_pts1.emplace_back(u1, v1);
+        }
+    }
+}
+
 float FrontendMatcher::descriptor_distance(const std::vector<float>& d1, const std::vector<float>& d2) {
     if (d1.empty() || d2.empty()) return 2.0f;
     int C = (int)std::min(d1.size(), d2.size());

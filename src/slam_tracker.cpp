@@ -28,22 +28,81 @@ SE3 Tracker::compute_predicted_pose(const std::vector<ImuMeasurement>& imu_measu
         imu_preintegrator.reset_state();
         imu_preintegrator.integrate_batch(imu_measurements, last_frame.timestamp, curr_frame.timestamp);
         if (imu_preintegrator.dt_total > 0.0) {
-            SE3 T_wc_i = last_frame.get_pose_inverse();
-            // 将机体系陀螺仪旋转变化量映射至相机光学系:
-            // 机身系 (X右, Y前, Z上) -> 相机光学系 (X右, Y下, Z前): R_cb = [[1,0,0],[0,0,-1],[0,1,0]]
-            Mat3 R_cb;
-            R_cb(0, 0) = 1.0; R_cb(0, 1) =  0.0; R_cb(0, 2) =  0.0;
-            R_cb(1, 0) = 0.0; R_cb(1, 1) =  0.0; R_cb(1, 2) = -1.0;
-            R_cb(2, 0) = 0.0; R_cb(2, 1) =  1.0; R_cb(2, 2) =  0.0;
-            Mat3 dR_cam = R_cb * imu_preintegrator.delta_R * R_cb.transpose();
-            Mat3 R_wc_j = SO3::normalize_rotation(T_wc_i.R * dR_cam);
+            // 左相机 (X右, Y下, Z前) 到水平机身系 Body (X右, Y前, Z上) 外参旋转矩阵 R_bc = [[1,0,0],[0,0,1],[0,-1,0]]
+            Mat3 R_bc;
+            R_bc(0, 0) = 1.0; R_bc(0, 1) =  0.0; R_bc(0, 2) = 0.0;
+            R_bc(1, 0) = 0.0; R_bc(1, 1) =  0.0; R_bc(1, 2) = 1.0;
+            R_bc(2, 0) = 0.0; R_bc(2, 1) = -1.0; R_bc(2, 2) = 0.0;
+            Mat3 dR_cam = R_bc.transpose() * imu_preintegrator.delta_R * R_bc;
+            Mat3 R_cw_pred = SO3::normalize_rotation(dR_cam.transpose() * last_frame.T_cw.R);
 
-            Vec3 p_w_j = T_wc_i.t;
-            if (has_velocity) {
-                double dt = std::max(1e-3, curr_frame.timestamp - last_frame.timestamp);
-                p_w_j += last_frame.v_w * dt;
+            // 实机单目+IMU (640x480) 闭环重力方向约束 (VIO Roll/Pitch Observability Constraint, 1:1 对齐 tracker.py):
+            // 在重力场中 Yaw 绕竖轴不可观 (完全由陀螺仪积分驱动)，而 Roll 与 Pitch 100% 受重力向量约束；
+            // 利用加速度计实测重力方向实时锚定 Roll/Pitch，彻底消除陀螺仪开环积分倾角漂移
+            Vec3 acc_mean(0.0, 0.0, 0.0);
+            Vec3 gyro_mean(0.0, 0.0, 0.0);
+            for (const auto& m : imu_measurements) {
+                acc_mean += m.acc;
+                gyro_mean += m.gyro;
             }
-            return SE3(R_wc_j, p_w_j).inverse();
+            double inv_n = 1.0 / (double)imu_measurements.size();
+            acc_mean *= inv_n;
+            gyro_mean *= inv_n;
+            double acc_norm = acc_mean.norm();
+
+            if (acc_norm > 8.2 && acc_norm < 11.5 && acc_mean.z > 5.0) {
+                Mat3 R_wc_gyro = R_cw_pred.transpose();
+                Mat3 R_wb_gyro = R_bc * R_wc_gyro * R_bc.transpose();
+                double sy = std::min(1.0, std::max(-1.0, -R_wb_gyro(2, 0)));
+                double pitch_gyro = std::asin(sy);
+                double roll_gyro  = std::atan2(R_wb_gyro(2, 1), R_wb_gyro(2, 2));
+                double yaw_gyro   = std::atan2(R_wb_gyro(1, 0), R_wb_gyro(0, 0));
+
+                double roll_acc  = std::atan2(acc_mean.y, acc_mean.z);
+                double pitch_acc = std::atan2(-acc_mean.x, std::hypot(acc_mean.y, acc_mean.z));
+                double tilt_gyro = std::hypot(gyro_mean.x, gyro_mean.y);
+                const double rad2deg = 180.0 / M_PI;
+
+                double roll_target, pitch_target, alpha_g;
+                if (tilt_gyro < 0.30 && (
+                    (std::abs(roll_acc * rad2deg) < 6.5 && std::abs(pitch_acc * rad2deg) < 6.5) ||
+                    (std::abs(gyro_mean.z) > 0.30 && std::abs(roll_gyro * rad2deg) < 5.0 && std::abs(pitch_gyro * rad2deg) < 5.0)
+                )) {
+                    roll_target  = 0.08 * roll_acc;
+                    pitch_target = 0.08 * pitch_acc;
+                    alpha_g      = 0.50;
+                } else {
+                    roll_target  = roll_acc;
+                    pitch_target = pitch_acc;
+                    alpha_g      = 0.25;
+                }
+
+                double r_f = (1.0 - alpha_g) * roll_gyro + alpha_g * roll_target;
+                double p_f = (1.0 - alpha_g) * pitch_gyro + alpha_g * pitch_target;
+                double cr = std::cos(r_f), sr = std::sin(r_f);
+                double cp = std::cos(p_f), sp = std::sin(p_f);
+                double cy = std::cos(yaw_gyro), sy_y = std::sin(yaw_gyro);
+
+                Mat3 Rx = Mat3::identity();
+                Rx(1, 1) = cr; Rx(1, 2) = -sr;
+                Rx(2, 1) = sr; Rx(2, 2) =  cr;
+
+                Mat3 Ry = Mat3::identity();
+                Ry(0, 0) =  cp; Ry(0, 2) = sp;
+                Ry(2, 0) = -sp; Ry(2, 2) = cp;
+
+                Mat3 Rz = Mat3::identity();
+                Rz(0, 0) = cy;   Rz(0, 1) = -sy_y;
+                Rz(1, 0) = sy_y; Rz(1, 1) =  cy;
+
+                Mat3 R_wb_grav = Rz * Ry * Rx;
+                Mat3 R_wc_grav = R_bc.transpose() * R_wb_grav * R_bc;
+                R_cw_pred = SO3::normalize_rotation(R_wc_grav.transpose());
+            }
+
+            Vec3 p_last = last_frame.get_camera_center();
+            Vec3 p_w_pred = has_velocity ? (p_last + last_frame.v_w * imu_preintegrator.dt_total) : p_last;
+            return SE3(R_cw_pred, -(R_cw_pred * p_w_pred));
         }
     }
 
@@ -65,20 +124,21 @@ void Tracker::monocular_initialization(
     FrontendMatcher::build_pyramid(gray_l.data(), camera.width, camera.height, 4,
                                    curr_frame.pyramid_left, curr_frame.pyr_widths, curr_frame.pyr_heights);
 
-    if (has_imu && has_last_frame) {
-        curr_frame.set_pose(compute_predicted_pose(imu_measurements));
-    } else {
-        curr_frame.set_pose(SE3::identity());
+    SE3 T_cw_init_pred = (has_imu && has_last_frame)
+        ? compute_predicted_pose(imu_measurements)
+        : SE3::identity();
+    curr_frame.set_pose(T_cw_init_pred);
+    if (has_imu) {
+        curr_frame.has_imu_rot_prior = true;
+        curr_frame.R_cw_imu_prior = T_cw_init_pred.R;
     }
 
-    if (!has_init_frame) {
-        if (curr_frame.num_kps >= 60) {
-            init_frame = curr_frame;
-            has_init_frame = true;
-            last_frame = curr_frame;
-            has_last_frame = true;
-            init_imu_preintegrator.reset_state();
-        }
+    if (!has_init_frame || init_frame.num_kps < 60) {
+        init_frame = curr_frame;
+        has_init_frame = (curr_frame.num_kps >= 60);
+        last_frame = curr_frame;
+        has_last_frame = true;
+        init_imu_preintegrator.reset_state();
         return;
     }
 
@@ -86,125 +146,140 @@ void Tracker::monocular_initialization(
         init_imu_preintegrator.integrate_batch(imu_measurements, last_frame.timestamp, timestamp);
     }
 
-    // 使用 HF-Net 256 维描述子在 init_frame 与 curr_frame 之间匹配
-    std::vector<int> matches12(init_frame.num_kps, -1);
-    std::vector<double> disp_list;
-    for (int i1 = 0; i1 < init_frame.num_kps; ++i1) {
-        if (init_frame.descriptors[i1].empty()) continue;
-        const Vec2& p1 = init_frame.kp_pts[i1];
-        std::vector<int> cands = curr_frame.get_features_in_area(p1.x, p1.y, 80.0);
-        float best_d = 10.0f, second_d = 10.0f;
-        int best_i2 = -1;
-        for (int i2 : cands) {
-            if (curr_frame.descriptors[i2].empty()) continue;
-            float d = FrontendMatcher::descriptor_distance(init_frame.descriptors[i1], curr_frame.descriptors[i2]);
-            if (d < best_d) {
-                second_d = best_d;
-                best_d = d;
-                best_i2 = i2;
-            } else if (d < second_d) {
-                second_d = d;
-            }
-        }
-        if (best_i2 >= 0 && best_d < 0.28f && best_d < 0.85f * second_d) {
-            matches12[i1] = best_i2;
-            disp_list.push_back((curr_frame.kp_pts[best_i2] - p1).norm());
-        }
-    }
+    // 1:1 对齐 Python tracker.py: 使用双向 4 层金字塔 LK 光流跟踪参考帧 F0 -> 当前帧 Fk (fb_err <= 1.5px)
+    std::vector<int> matched_idx0;
+    std::vector<Vec2> matched_pts0;
+    std::vector<Vec2> matched_pts1;
+    FrontendMatcher::track_init_optical_flow(
+        init_frame, curr_frame.pyramid_left, curr_frame.pyr_widths, curr_frame.pyr_heights,
+        camera, matched_idx0, matched_pts0, matched_pts1
+    );
 
-    int n_matched = (int)disp_list.size();
-    if (n_matched < 45) {
+    if ((int)matched_pts0.size() < 45) {
         init_frame = curr_frame;
         last_frame = curr_frame;
         init_imu_preintegrator.reset_state();
         return;
     }
 
-    std::sort(disp_list.begin(), disp_list.end());
-    double med_disp = disp_list[disp_list.size() / 2];
-    int frames_wait = curr_frame.id - init_frame.id;
+    std::vector<double> parallax_list(matched_pts0.size());
+    for (size_t i = 0; i < matched_pts0.size(); ++i) {
+        parallax_list[i] = (matched_pts1[i] - matched_pts0[i]).norm();
+    }
+    std::sort(parallax_list.begin(), parallax_list.end());
+    double med_parallax = parallax_list[parallax_list.size() / 2];
 
-    // 实机单目+IMU模式快速冷启动 (等待 2 帧或视差 >= 6px 即可建立初始关键帧与深度先验地图点)
-    if (med_disp < 6.0 && frames_wait < 2) {
+    if ((curr_frame.id - init_frame.id) < 2) {
+        last_frame = curr_frame;
+        return;
+    }
+    if (!has_imu && med_parallax < 6.0 && (curr_frame.id - init_frame.id) < 3) {
         last_frame = curr_frame;
         return;
     }
 
-    init_frame.set_pose(SE3::identity());
-    Mat3 R_10 = Mat3::identity();
-    if (init_imu_preintegrator.dt_total > 0.0) {
-        Mat3 R_cb;
-        R_cb(0, 0) = 1.0; R_cb(0, 1) =  0.0; R_cb(0, 2) =  0.0;
-        R_cb(1, 0) = 0.0; R_cb(1, 1) =  0.0; R_cb(1, 2) = -1.0;
-        R_cb(2, 0) = 0.0; R_cb(2, 1) =  1.0; R_cb(2, 2) =  0.0;
-        Mat3 dR_cam = R_cb * init_imu_preintegrator.delta_R * R_cb.transpose();
-        R_10 = dR_cam.transpose();
+    // 实机桌面单目+IMU模式 (640x480): 利用 IMU 陀螺仪去旋转光流 + 室内物理渐变深度先验完成平滑冷启动
+    Mat3 R_10 = T_cw_init_pred.R * init_frame.T_cw.R.transpose();
+    double fx = camera.fx, fy = camera.fy, cx = camera.cx, cy = camera.cy;
+    size_t n_m = matched_idx0.size();
+    std::vector<Vec3> x0_n(n_m);
+    std::vector<double> derot_dx(n_m), derot_dy(n_m);
+    for (size_t k = 0; k < n_m; ++k) {
+        x0_n[k] = Vec3((matched_pts0[k].x - cx) * camera.inv_fx,
+                       (matched_pts0[k].y - cy) * camera.inv_fy, 1.0);
+        Vec3 x1_k((matched_pts1[k].x - cx) * camera.inv_fx,
+                  (matched_pts1[k].y - cy) * camera.inv_fy, 1.0);
+        Vec3 x0_rot = R_10 * x0_n[k];
+        derot_dx[k] = x1_k.x - x0_rot.x;
+        derot_dy[k] = x1_k.y - x0_rot.y;
     }
+    std::sort(derot_dx.begin(), derot_dx.end());
+    std::sort(derot_dy.begin(), derot_dy.end());
+    const double z_prior = 1.20;
+    double tx_est = derot_dx[n_m / 2] * z_prior;
+    double ty_est = derot_dy[n_m / 2] * z_prior;
+    Vec3 t_raw(tx_est, ty_est, 0.0);
+    double t_norm = t_raw.norm();
+    if (t_norm > 0.03) {
+        t_raw *= (0.03 / t_norm);
+    }
+    Vec3 t_10_scaled = t_raw;
 
-    // 估计初始平移基线 (静止微视差时采用零位移 + 1.2m 室内物理深度先验)
-    Vec3 t_10(0.0, 0.0, 0.0);
-    if (med_disp >= 8.0) {
-        double sum_du = 0.0, sum_dv = 0.0;
-        int cnt = 0;
-        for (int i1 = 0; i1 < init_frame.num_kps; ++i1) {
-            int i2 = matches12[i1];
-            if (i2 < 0) continue;
-            sum_du += (curr_frame.kp_pts[i2].x - init_frame.kp_pts[i1].x);
-            sum_dv += (curr_frame.kp_pts[i2].y - init_frame.kp_pts[i1].y);
-            cnt++;
-        }
-        if (cnt > 0) {
-            double du_m = (sum_du / cnt) * camera.inv_fx * 1.2;
-            double dv_m = (sum_dv / cnt) * camera.inv_fy * 1.2;
-            double step_norm = std::hypot(du_m, dv_m);
-            if (step_norm > 0.04) {
-                du_m *= (0.04 / step_norm);
-                dv_m *= (0.04 / step_norm);
-            }
-            t_10 = Vec3(du_m, dv_m, 0.0);
-        }
+    // 将光流跟踪点合并至当前帧 F1 的特征列表 (1:1 对齐 Python lines 896-945)
+    int base_n = curr_frame.num_kps;
+    for (size_t k = 0; k < n_m; ++k) {
+        int idx0 = matched_idx0[k];
+        curr_frame.kp_pts.push_back(matched_pts1[k]);
+        curr_frame.kp_octaves.push_back(0);
+        curr_frame.kp_scores.push_back(init_frame.kp_scores[idx0]);
+        curr_frame.descriptors.push_back(init_frame.descriptors[idx0]);
+        curr_frame.u_right.push_back(-1.0f);
+        curr_frame.depths.push_back(-1.0f);
+        curr_frame.map_points.push_back(nullptr);
+        curr_frame.outliers.push_back(false);
     }
-    curr_frame.set_pose(SE3(R_10, t_10));
+    curr_frame.num_kps = (int)curr_frame.kp_pts.size();
+    curr_frame.assign_features_to_grid();
+
+    init_frame.set_pose(SE3::identity());
+    curr_frame.set_pose(SE3(R_10, t_10_scaled));
+    if (has_imu) {
+        curr_frame.has_imu_rot_prior = true;
+        curr_frame.R_cw_imu_prior = R_10;
+        init_frame.has_imu_rot_prior = true;
+        init_frame.R_cw_imu_prior = Mat3::identity();
+    }
 
     auto kf0 = std::make_shared<KeyFrame>(init_frame);
     auto kf1 = std::make_shared<KeyFrame>(curr_frame);
     slam_map->add_keyframe(kf0);
     slam_map->add_keyframe(kf1);
 
-    int created_mps = 0;
-    const double default_z = 1.20;
-    for (int i1 = 0; i1 < init_frame.num_kps; ++i1) {
-        int i2 = matches12[i1];
-        if (i2 < 0) continue;
-
-        Vec3 xn1 = camera.unproject(init_frame.kp_pts[i1].x, init_frame.kp_pts[i1].y, 1.0);
-        Vec3 xn2 = camera.unproject(curr_frame.kp_pts[i2].x, curr_frame.kp_pts[i2].y, 1.0);
-        Vec3 pos_w;
-        if (!triangulate_two_views(kf0->T_cw, kf1->T_cw, xn1, xn2, pos_w)) {
-            pos_w = camera.unproject(curr_frame.kp_pts[i2].x, curr_frame.kp_pts[i2].y, default_z);
-            pos_w = kf1->get_pose_inverse().transform(pos_w);
+    for (size_t k = 0; k < n_m; ++k) {
+        int idx0 = matched_idx0[k];
+        int idx1 = base_n + (int)k;
+        double z0 = z_prior * (0.85 + 0.30 * (1.0 - matched_pts0[k].y / (double)camera.height));
+        Vec3 pos_w = x0_n[k] * z0;
+        if (!has_imu && med_parallax >= 8.0) {
+            Vec3 xn1 = camera.unproject(matched_pts0[k].x, matched_pts0[k].y, 1.0);
+            Vec3 xn2 = camera.unproject(matched_pts1[k].x, matched_pts1[k].y, 1.0);
+            Vec3 tri_w;
+            if (triangulate_two_views(kf0->T_cw, kf1->T_cw, xn1, xn2, tri_w)) {
+                pos_w = tri_w;
+            }
         }
 
-        auto mp = std::make_shared<MapPoint>(pos_w, kf1, curr_frame.id, curr_frame.descriptors[i2]);
-        kf0->add_mappoint(mp, i1);
-        kf1->add_mappoint(mp, i2);
-        mp->add_observation(kf0.get(), i1);
-        mp->add_observation(kf1.get(), i2);
+        auto mp = std::make_shared<MapPoint>(pos_w, kf0, init_frame.id, init_frame.descriptors[idx0]);
+        mp->add_observation(kf0.get(), idx0);
+        mp->add_observation(kf1.get(), idx1);
+        kf0->add_mappoint(mp, idx0);
+        kf1->add_mappoint(mp, idx1);
+        curr_frame.map_points[idx1] = mp;
         mp->compute_distinctive_descriptors();
         mp->update_normal_and_depth();
         slam_map->add_mappoint(mp);
-        curr_frame.map_points[i2] = mp;
-        created_mps++;
     }
 
     kf0->update_connections();
     kf1->update_connections();
+
+    // 初始化完成后立即执行 3 轮 Local BA 并同步位姿与阻尼初速度 (1:1 对齐 Python lines 948-963)
+    Optimizer::local_bundle_adjustment(kf1, *slam_map, 3);
+    curr_frame.set_pose(kf1->T_cw);
 
     ref_kf = kf1;
     curr_frame.ref_kf = kf1;
     last_frame = curr_frame;
     has_last_frame = true;
     last_kf_frame_id = curr_frame.id;
+    local_keyframes = {kf0.get(), kf1.get()};
+    local_mappoints = slam_map->get_all_mappoints();
+
+    double n_init_span = (double)std::max(2, curr_frame.id - init_frame.id);
+    SE3 T_delta_init = kf1->T_cw * kf0->T_cw.inverse();
+    double damp_factor = 0.25 / n_init_span;
+    velocity = SE3(T_delta_init.R, T_delta_init.t * damp_factor);
+    has_velocity = true;
     state = TrackingState::OK;
 }
 
@@ -216,153 +291,186 @@ void Tracker::estimate_rotation_and_trans_gate(
     Mat3& R_cw_prior_inout,
     double& trans_gate_out
 ) {
-    int n_pts = (int)flow_pts.size();
-    if (!has_last_frame || !last_frame.has_pose || n_pts < 8) {
-        trans_gate_out = 1.0;
-        last_diag.trans_gate = 1.0;
-        last_diag.eff_gyro_deg_s = 0.0;
-        last_diag.raw_flow_px = 0.0;
-        last_diag.derot_res_px = 0.0;
-        last_diag.radial_med_px = 0.0;
-        return;
-    }
-
-    double fx = camera.fx, fy = camera.fy, cx = camera.cx, cy = camera.cy;
-    Mat3 R_last = last_frame.T_cw.R;
-    Vec3 p_last = last_frame.get_camera_center();
-
-    std::vector<Vec2> prev_uvs;
-    std::vector<Vec2> curr_uvs;
-    std::vector<Vec3> dirs_last;
-    std::vector<Vec3> dirs_curr;
-    std::vector<double> raw_flows;
-
-    prev_uvs.reserve(n_pts);
-    curr_uvs.reserve(n_pts);
-    dirs_last.reserve(n_pts);
-    dirs_curr.reserve(n_pts);
-    raw_flows.reserve(n_pts);
-
-    for (int i = 0; i < n_pts; ++i) {
-        const auto& mp = flow_mps[i];
-        if (!mp || mp->is_bad) continue;
-        Vec3 v_c_last = R_last * (mp->pos_w - p_last);
-        if (v_c_last.z <= 0.15) continue;
-        Vec2 uv_prev = camera.project(v_c_last);
-        Vec2 uv_curr = flow_pts[i];
-        double flow_len = (uv_curr - uv_prev).norm();
-        if (flow_len > 80.0) continue;
-
-        prev_uvs.push_back(uv_prev);
-        curr_uvs.push_back(uv_curr);
-        raw_flows.push_back(flow_len);
-        dirs_last.push_back(v_c_last.normalized());
-        dirs_curr.push_back(Vec3((uv_curr.x - cx) / fx, (uv_curr.y - cy) / fy, 1.0).normalized());
-    }
-
-    int m = (int)dirs_last.size();
-    if (m < 8) {
+    if (!has_last_frame || !last_frame.has_pose) {
         trans_gate_out = 1.0;
         return;
     }
 
-    std::sort(raw_flows.begin(), raw_flows.end());
-    double raw_flow_med = raw_flows[m / 2];
+    // 1. 维护 3 帧陀螺仪三维向量滑动均值 (1:1 对齐 Python lines 1065-1075: 仅信任真实陀螺仪角速度，绝不混入伪视觉角速度)
+    Vec3 curr_gyro_vec(0.0, 0.0, 0.0);
+    if (!imu_measurements.empty()) {
+        for (const auto& m : imu_measurements) curr_gyro_vec += m.gyro;
+        curr_gyro_vec *= (1.0 / (double)imu_measurements.size());
+    }
+    gyro_vec_hist_.push_back(curr_gyro_vec);
+    if (gyro_vec_hist_.size() > 3) {
+        gyro_vec_hist_.erase(gyro_vec_hist_.begin());
+    }
+    Vec3 avg_gyro_vec(0.0, 0.0, 0.0);
+    for (const auto& g : gyro_vec_hist_) avg_gyro_vec += g;
+    avg_gyro_vec *= (1.0 / (double)gyro_vec_hist_.size());
 
-    // 1. 视觉消旋迭代求解帧间纯旋转矩阵 R_rel_vis (使得 dirs_curr ≈ R_rel_vis * dirs_last)
-    Mat3 R_rel_vis = has_rot_prior_inout ? (R_cw_prior_inout * R_last.transpose()) : Mat3::identity();
-    for (int it = 0; it < 3; ++it) {
-        Mat3 H_r = Mat3::diag(1e-4, 1e-4, 1e-4);
-        Vec3 b_r(0, 0, 0);
-        for (int i = 0; i < m; ++i) {
-            Vec3 d_rot = R_rel_vis * dirs_last[i];
-            Vec3 err = d_rot.cross(dirs_curr[i]); // 小角度旋转残差
-            double e_n = err.norm();
-            double w = (e_n > 0.015) ? (0.015 / e_n) : 1.0;
-            for (int r = 0; r < 3; ++r) {
-                b_r[r] += w * err[r];
-                H_r(r, r) += w;
+    const double rad2deg = 180.0 / M_PI;
+    double avg_gyro_deg_s  = avg_gyro_vec.norm() * rad2deg;
+    double curr_gyro_deg_s = curr_gyro_vec.norm() * rad2deg;
+    double eff_gyro_deg_s  = std::max(avg_gyro_deg_s, 0.70 * curr_gyro_deg_s);
+
+    // 2. 收集上一帧与当前帧光流匹配点对 (1:1 对齐 Python lines 1077-1088)
+    std::map<int, Vec2> last_mp_to_pt;
+    for (int i_l = 0; i_l < last_frame.num_kps; ++i_l) {
+        const auto& mp_l = last_frame.map_points[i_l];
+        if (mp_l && !mp_l->is_bad && !last_frame.outliers[i_l]) {
+            last_mp_to_pt[mp_l->id] = last_frame.kp_pts[i_l];
+        }
+    }
+
+    std::vector<Vec2> pts0;
+    std::vector<Vec2> pts1;
+    pts0.reserve(flow_pts.size());
+    pts1.reserve(flow_pts.size());
+    for (size_t i = 0; i < flow_pts.size(); ++i) {
+        const auto& mp1 = flow_mps[i];
+        if (mp1) {
+            auto it = last_mp_to_pt.find(mp1->id);
+            if (it != last_mp_to_pt.end()) {
+                pts0.push_back(it->second);
+                pts1.push_back(flow_pts[i]);
             }
         }
-        Vec3 dphi;
-        if (solve_linear_3x3(H_r, b_r, dphi)) {
-            R_rel_vis = SO3::normalize_rotation(SO3::exp(dphi) * R_rel_vis);
-        }
     }
 
-    // 2. 计算消旋后的残差光流中位数 derot_res_px 与径向发散/收缩流 radial_med_px
-    std::vector<double> derot_res_list;
-    std::vector<double> radial_list;
-    derot_res_list.reserve(m);
-    radial_list.reserve(m);
-
-    for (int i = 0; i < m; ++i) {
-        Vec3 d_rot = R_rel_vis * dirs_last[i];
-        if (d_rot.z <= 0.1) continue;
-        double u_rot = fx * (d_rot.x / d_rot.z) + cx;
-        double v_rot = fy * (d_rot.y / d_rot.z) + cy;
-        double res_u = curr_uvs[i].x - u_rot;
-        double res_v = curr_uvs[i].y - v_rot;
-        derot_res_list.push_back(std::hypot(res_u, res_v));
-
-        double rx = prev_uvs[i].x - cx;
-        double ry = prev_uvs[i].y - cy;
-        double r_len = std::hypot(rx, ry);
-        if (r_len > 30.0) {
-            radial_list.push_back((res_u * rx + res_v * ry) / r_len);
-        }
-    }
-
+    double raw_flow_px = 0.0;
     double derot_res_px = 0.0;
-    if (!derot_res_list.empty()) {
-        std::sort(derot_res_list.begin(), derot_res_list.end());
-        derot_res_px = derot_res_list[derot_res_list.size() / 2];
-    }
     double radial_med_px = 0.0;
-    if (!radial_list.empty()) {
-        std::sort(radial_list.begin(), radial_list.end());
-        radial_med_px = std::abs(radial_list[radial_list.size() / 2]);
-    }
 
-    // 3. 计算有效旋转角速度 eff_gyro_deg_s (融合 IMU 陀螺仪与视觉旋转角)
-    double dt = std::max(1e-3, curr_frame.timestamp - last_frame.timestamp);
-    double vis_rot_deg = std::acos(std::min(1.0, std::max(-1.0, 0.5 * (R_rel_vis.trace() - 1.0)))) * (180.0 / M_PI);
-    double vis_gyro_deg_s = vis_rot_deg / dt;
-    double imu_gyro_deg_s = 0.0;
-    if (!imu_measurements.empty()) {
-        for (const auto& im : imu_measurements) {
-            imu_gyro_deg_s = std::max(imu_gyro_deg_s, im.gyro.norm() * (180.0 / M_PI));
+    int m = (int)pts0.size();
+    if (m >= 12) {
+        double fx = camera.fx, fy = camera.fy, cx = camera.cx, cy = camera.cy;
+        std::vector<double> raw_flows(m);
+        std::vector<Vec3> x0(m), x1(m), b0(m), b1(m);
+        for (int i = 0; i < m; ++i) {
+            raw_flows[i] = (pts1[i] - pts0[i]).norm();
+            x0[i] = Vec3((pts0[i].x - cx) * camera.inv_fx, (pts0[i].y - cy) * camera.inv_fy, 1.0);
+            x1[i] = Vec3((pts1[i].x - cx) * camera.inv_fx, (pts1[i].y - cy) * camera.inv_fy, 1.0);
+            b0[i] = x0[i].normalized();
+            b1[i] = x1[i].normalized();
+        }
+        std::vector<double> rf_sorted = raw_flows;
+        std::sort(rf_sorted.begin(), rf_sorted.end());
+        raw_flow_px = rf_sorted[m / 2];
+
+        // 两轮 IRLS 加权求解视觉纯旋转 dR_vis (仅用于计算去旋转光流残差，绝不覆盖 R_cw_imu_prior)
+        Mat3 dR_vis = Mat3::identity();
+        std::vector<double> w_irls(m, 1.0);
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int it = 0; it < 3; ++it) {
+                Mat3 H_r = Mat3::diag(1e-5, 1e-5, 1e-5);
+                Vec3 b_r(0, 0, 0);
+                for (int i = 0; i < m; ++i) {
+                    Vec3 d_rot = dR_vis * b0[i];
+                    Vec3 err = d_rot.cross(b1[i]);
+                    double w = w_irls[i];
+                    for (int r = 0; r < 3; ++r) {
+                        b_r[r] += w * err[r];
+                        H_r(r, r) += w;
+                    }
+                }
+                Vec3 dphi;
+                if (solve_linear_3x3(H_r, b_r, dphi)) {
+                    dR_vis = SO3::normalize_rotation(SO3::exp(dphi) * dR_vis);
+                }
+            }
+            for (int i = 0; i < m; ++i) {
+                Vec3 x0_rot = dR_vis * x0[i];
+                double z_rot = std::max(1e-4, x0_rot.z);
+                double u1_rot = fx * (x0_rot.x / z_rot) + cx;
+                double v1_rot = fy * (x0_rot.y / z_rot) + cy;
+                double res_i = std::hypot(pts1[i].x - u1_rot, pts1[i].y - v1_rot);
+                w_irls[i] = 1.0 / std::max(1.0, res_i / 1.5);
+            }
+        }
+
+        std::vector<double> res_px(m);
+        std::vector<double> derot_du(m), derot_dv(m);
+        for (int i = 0; i < m; ++i) {
+            Vec3 x0_rot = dR_vis * x0[i];
+            double z_rot = std::max(1e-4, x0_rot.z);
+            double u1_rot = fx * (x0_rot.x / z_rot) + cx;
+            double v1_rot = fy * (x0_rot.y / z_rot) + cy;
+            derot_du[i] = pts1[i].x - u1_rot;
+            derot_dv[i] = pts1[i].y - v1_rot;
+            res_px[i] = std::hypot(derot_du[i], derot_dv[i]);
+        }
+        std::vector<double> res_sorted = res_px;
+        std::sort(res_sorted.begin(), res_sorted.end());
+        derot_res_px = res_sorted[m / 2];
+
+        // 平稳平移阶段 (eff_gyro_deg_s < 6.0 deg/s 且 prev_gate >= 0.85) 结合 IMU 真实物理去旋转光流残差 (对齐 Python lines 1132-1140)
+        double prev_gate_est = last_diag.trans_gate;
+        if (has_rot_prior_inout && eff_gyro_deg_s < 6.0 && prev_gate_est >= 0.85) {
+            Mat3 dR_imu = R_cw_prior_inout * last_frame.T_cw.R.transpose();
+            std::vector<double> imu_res_list(m);
+            for (int i = 0; i < m; ++i) {
+                Vec3 x0_imu = dR_imu * x0[i];
+                double z_imu = std::max(1e-4, x0_imu.z);
+                double u1_imu = fx * (x0_imu.x / z_imu) + cx;
+                double v1_imu = fy * (x0_imu.y / z_imu) + cy;
+                imu_res_list[i] = std::hypot(pts1[i].x - u1_imu, pts1[i].y - v1_imu);
+            }
+            std::sort(imu_res_list.begin(), imu_res_list.end());
+            double imu_res_px = imu_res_list[m / 2];
+            derot_res_px = std::max(derot_res_px, std::min(imu_res_px, raw_flow_px));
+        }
+
+        // 计算去旋转后的径向膨胀/收缩量 radial_med_px (对齐 Python lines 1142-1153: r0_norm > 50.0 且点数 >= 8)
+        std::vector<double> rad_proj;
+        rad_proj.reserve(m);
+        for (int i = 0; i < m; ++i) {
+            double rx0 = pts0[i].x - cx;
+            double ry0 = pts0[i].y - cy;
+            double r0_norm = std::hypot(rx0, ry0);
+            if (r0_norm > 50.0) {
+                rad_proj.push_back((derot_du[i] * rx0 + derot_dv[i] * ry0) / r0_norm);
+            }
+        }
+        if ((int)rad_proj.size() >= 8) {
+            std::sort(rad_proj.begin(), rad_proj.end());
+            radial_med_px = std::abs(rad_proj[rad_proj.size() / 2]);
         }
     }
-    double eff_gyro_deg_s = std::max(imu_gyro_deg_s, vis_gyro_deg_s);
 
-    // 4. 纯旋转平移门控 (Pure-Rotation Translation Gating):
-    // 当检测到显著角速度 (eff_gyro_deg_s > 6.5 deg/s) 且消旋残差占总光流比例很低时，闭锁伪平移
+    // 3. 门控判据 (1:1 对齐 Python lines 1159-1179):
+    // - 静止死区 (raw_flow_px < 0.48px 且 eff_gyro_deg_s < 1.0): 锁定零平移与零姿态漂移
+    // - 手持平移运动 (eff_gyro_deg_s < 9.5 deg/s): 完全放开平移 (trans_gate = 1.0)，绝不将横向平移误判为旋转
+    // - 确认旋转 (eff_gyro_deg_s >= 9.5 deg/s): 仅当陀螺仪确有显著角速度时才启动旋转平移门控
+    double max_rot_res = std::max({2.20, 0.14 * raw_flow_px, 0.11 * eff_gyro_deg_s});
+    bool is_stationary = (
+        raw_flow_px < 0.48 && derot_res_px < 0.25 && radial_med_px < 0.12 && eff_gyro_deg_s < 1.0
+    );
+    double prev_gate = last_diag.trans_gate;
     double trans_gate = 1.0;
-    if (eff_gyro_deg_s > 6.5) {
-        double rot_explain_ratio = derot_res_px / std::max(1.0, raw_flow_med);
-        if (eff_gyro_deg_s > 12.0 || rot_explain_ratio < 0.42) {
-            trans_gate = 0.0;
-        } else {
-            trans_gate = std::max(0.0, std::min(1.0, (12.0 - eff_gyro_deg_s) / 5.5));
-        }
-    } else if (raw_flow_med < 0.55 && derot_res_px < 0.45 && radial_med_px < 0.25) {
-        // 亚像素静止死区门控
-        trans_gate = 0.15;
+    if (is_stationary) {
+        trans_gate = 0.0;
+    } else if (eff_gyro_deg_s < 9.5) {
+        trans_gate = (prev_gate < 0.50 && eff_gyro_deg_s >= 5.5) ? 0.0 : 1.0;
+    } else if (eff_gyro_deg_s < 16.0 && (
+        derot_res_px > max_rot_res || (radial_med_px > 0.85 && radial_med_px > 0.22 * raw_flow_px)
+    )) {
+        trans_gate = 1.0;
+    } else {
+        trans_gate = 0.0;
     }
 
-    if (!has_rot_prior_inout) {
-        R_cw_prior_inout = SO3::normalize_rotation(R_rel_vis * R_last);
+    // 静止死区保持上一帧姿态稳定；其余全部阶段严格信任 IMU 旋转先验 R_cw_prior_inout (严禁用 dR_vis 覆盖)
+    if (is_stationary) {
+        R_cw_prior_inout = last_frame.T_cw.R;
         has_rot_prior_inout = true;
-    } else if (trans_gate < 0.35) {
-        // 纯旋转期间融合视觉精细消旋角与 IMU 重力水平约束
-        R_cw_prior_inout = SO3::normalize_rotation(R_rel_vis * R_last);
     }
 
     trans_gate_out = trans_gate;
     last_diag.trans_gate = trans_gate;
     last_diag.eff_gyro_deg_s = eff_gyro_deg_s;
-    last_diag.raw_flow_px = raw_flow_med;
+    last_diag.raw_flow_px = raw_flow_px;
     last_diag.derot_res_px = derot_res_px;
     last_diag.radial_med_px = radial_med_px;
 }
@@ -381,11 +489,11 @@ void Tracker::merge_flow_and_hfnet_features(
         const Vec2& pt = flow_pts[i];
 
         int best_j = -1;
-        double best_d2 = 9.0; // 3.0 px 半径内吸附并修正为亚像素光流坐标
+        double best_d2 = 2.25; // 1.5 px 半径内吸附并修正为亚像素光流坐标 (1:1 对齐 Python d2 <= 2.25)
         for (int j = 0; j < n_hf; ++j) {
             if (frame.map_points[j] != nullptr) continue;
             double d2 = (frame.kp_pts[j] - pt).squared_norm();
-            if (d2 < best_d2) {
+            if (d2 <= best_d2) {
                 best_d2 = d2;
                 best_j = j;
             }
@@ -725,8 +833,11 @@ SE3 Tracker::grab_image_monocular_inertial(
     curr_frame.timestamp = timestamp;
     SE3 T_cw_pred_init = compute_predicted_pose(imu_measurements);
     bool has_imu_prior = (!imu_measurements.empty() && imu_preintegrator.dt_total > 0.0);
-    Mat3 R_cw_imu_prior = has_imu_prior ? T_cw_pred_init.R : Mat3::identity();
-    double w_rot_imu = 2.0e6;
+    Mat3 R_cw_imu_prior = has_imu_prior
+        ? T_cw_pred_init.R
+        : ((has_last_frame && last_frame.has_pose) ? last_frame.T_cw.R : Mat3::identity());
+    bool has_rot_prior = has_imu_prior || (has_last_frame && last_frame.has_pose);
+    double w_rot_imu = has_rot_prior ? 2.0e6 : 0.0;
     double trans_gate = 1.0;
 
     bool has_flow_prior_pose = false;
@@ -745,15 +856,15 @@ SE3 Tracker::grab_image_monocular_inertial(
         );
 
         estimate_rotation_and_trans_gate(
-            flow_pts, flow_mps, imu_measurements, has_imu_prior, R_cw_imu_prior, trans_gate
+            flow_pts, flow_mps, imu_measurements, has_rot_prior, R_cw_imu_prior, trans_gate
         );
 
-        if (has_imu_prior) {
+        if (has_rot_prior) {
             Vec3 p_pred = T_cw_pred_init.camera_center();
             T_cw_pred_init = SE3(R_cw_imu_prior, -(R_cw_imu_prior * p_pred));
         }
 
-        if ((int)flow_pts.size() >= 18) {
+        if ((int)flow_pts.size() >= 28) {
             std::vector<Keypoint> flow_kps(flow_pts.size());
             for (size_t i = 0; i < flow_pts.size(); ++i) {
                 flow_kps[i].x = (float)flow_pts[i].x;
@@ -767,13 +878,23 @@ SE3 Tracker::grab_image_monocular_inertial(
             curr_frame.pyr_heights = curr_pyr_h;
             curr_frame.map_points = flow_mps;
             curr_frame.ref_kf = ref_kf;
-            curr_frame.has_imu_rot_prior = has_imu_prior;
+            curr_frame.has_imu_rot_prior = has_rot_prior;
             curr_frame.R_cw_imu_prior = R_cw_imu_prior;
             curr_frame.set_pose(T_cw_pred_init);
 
             n_inliers = Optimizer::pose_optimization(
-                curr_frame, 6, has_imu_prior ? &R_cw_imu_prior : nullptr, w_rot_imu
+                curr_frame, 6, has_rot_prior ? &R_cw_imu_prior : nullptr, w_rot_imu
             );
+
+            // 实机 640x480 旋转阶段 (trans_gate < 0.85): 串口 IMU 与 USB 摄像头存在 10~30ms 包相位差，
+            // 对已通过双向 LK 光流一致性校验 (fb_err <= 1.5px) 的跟踪点豁免因 IMU 瞬时相位差导致的卡方误剔除 (1:1 对齐 tracker.py lines 502-506)
+            if (trans_gate < 0.85 && n_inliers < (int)(0.75 * flow_pts.size())) {
+                std::fill(curr_frame.outliers.begin(), curr_frame.outliers.end(), false);
+                n_inliers = 0;
+                for (const auto& mp : curr_frame.map_points) {
+                    if (mp && !mp->is_bad) n_inliers++;
+                }
+            }
 
             for (int i = 0; i < curr_frame.num_kps; ++i) {
                 auto mp = curr_frame.map_points[i];
@@ -789,9 +910,10 @@ SE3 Tracker::grab_image_monocular_inertial(
 
             if (n_inliers >= 18) {
                 Vec3 p_flow_opt = curr_frame.get_camera_center();
-                Mat3 R_flow_opt = has_imu_prior ? R_cw_imu_prior : curr_frame.T_cw.R;
+                Mat3 R_flow_opt = has_rot_prior ? R_cw_imu_prior : curr_frame.T_cw.R;
                 T_cw_flow_prior = SE3(R_flow_opt, -(R_flow_opt * p_flow_opt));
                 has_flow_prior_pose = true;
+                flow_mps = curr_frame.map_points;
             }
 
             int frames_since_kf = curr_frame.id - last_kf_frame_id;
@@ -821,7 +943,7 @@ SE3 Tracker::grab_image_monocular_inertial(
 
         merge_flow_and_hfnet_features(flow_pts, flow_mps, curr_frame);
         curr_frame.ref_kf = ref_kf;
-        curr_frame.has_imu_rot_prior = has_imu_prior;
+        curr_frame.has_imu_rot_prior = has_rot_prior;
         curr_frame.R_cw_imu_prior = R_cw_imu_prior;
         curr_frame.set_pose(has_flow_prior_pose ? T_cw_flow_prior : T_cw_pred_init);
 
@@ -830,16 +952,16 @@ SE3 Tracker::grab_image_monocular_inertial(
         for (const auto& mp : curr_frame.map_points) if (mp && !mp->is_bad) pre_matches++;
         if (pre_matches >= 6) {
             Optimizer::pose_optimization(
-                curr_frame, 6, has_imu_prior ? &R_cw_imu_prior : nullptr, w_rot_imu
+                curr_frame, 6, has_rot_prior ? &R_cw_imu_prior : nullptr, w_rot_imu
             );
         }
-        n_inliers = track_local_map(has_imu_prior ? &R_cw_imu_prior : nullptr, w_rot_imu);
+        n_inliers = track_local_map(has_rot_prior ? &R_cw_imu_prior : nullptr, w_rot_imu);
     }
 
     // 连续位姿锚定、纯旋转平移门控与光流比例步长保护 (1:1 对齐 Python tracker.py)
     if (has_last_frame && last_frame.has_pose) {
         Vec3 p_last_ref = last_frame.get_camera_center();
-        Mat3 R_safe = has_imu_prior ? R_cw_imu_prior : curr_frame.T_cw.R;
+        Mat3 R_safe = has_rot_prior ? R_cw_imu_prior : curr_frame.T_cw.R;
         Vec3 p_curr_raw = curr_frame.get_camera_center();
         if (has_flow_prior_pose) {
             Vec3 p_flow = T_cw_flow_prior.camera_center();
@@ -890,6 +1012,11 @@ SE3 Tracker::grab_image_monocular_inertial(
             : p_after_kf;
         curr_frame.set_pose(SE3(R_before_kf, -(R_before_kf * p_clamped)));
         if (ref_kf) ref_kf->set_pose(curr_frame.T_cw);
+        int valid_after_kf = 0;
+        for (const auto& mp : curr_frame.map_points) {
+            if (mp && !mp->is_bad) valid_after_kf++;
+        }
+        n_inliers = std::max(n_inliers, valid_after_kf);
     } else if (need_kf_or_retrack && n_inliers < 210) {
         n_inliers = replenish_live_flow_features(gray_l, scores_dense, desc_raw, desc_is_nchw, n_inliers);
     }

@@ -52,17 +52,42 @@ StereoCamera StereoCamera::from_calib_json(const std::string& json_path, int def
     ss << ifs.rdbuf();
     std::string txt = ss.str();
 
-    double fx_v = 622.0, fy_v = 622.0, cx_v = default_w * 0.5, cy_v = default_h * 0.5, bl_v = 0.060;
+    double fx_v = 626.5631, fy_v = 626.1365, cx_v = 266.7727, cy_v = 270.4394, bl_v = 0.060;
     double w_v = default_w, h_v = default_h, fps_v = 30.0;
+    size_t kl_pos = txt.find("\"K_l\"");
+    if (kl_pos != std::string::npos) {
+        std::vector<double> kl_vals;
+        size_t p = txt.find('[', kl_pos);
+        while (p != std::string::npos && p < txt.size() && kl_vals.size() < 9) {
+            char c = txt[p];
+            if ((c >= '0' && c <= '9') || c == '-' || c == '+') {
+                char* endp = nullptr;
+                double v = std::strtod(txt.c_str() + p, &endp);
+                if (endp > txt.c_str() + p) {
+                    kl_vals.push_back(v);
+                    p = (size_t)(endp - txt.c_str());
+                    continue;
+                }
+            }
+            p++;
+        }
+        if (kl_vals.size() >= 6) {
+            fx_v = kl_vals[0];
+            cx_v = kl_vals[2];
+            fy_v = kl_vals[4];
+            cy_v = kl_vals[5];
+        }
+    }
     parse_json_double(txt, "fx", fx_v);
     parse_json_double(txt, "fy", fy_v);
     parse_json_double(txt, "cx", cx_v);
     parse_json_double(txt, "cy", cy_v);
+    parse_json_double(txt, "baseline_m", bl_v);
     parse_json_double(txt, "baseline", bl_v);
     parse_json_double(txt, "width", w_v);
     parse_json_double(txt, "height", h_v);
     parse_json_double(txt, "fps", fps_v);
-    return StereoCamera(fx_v, fy_v, cx_v, cy_v, bl_v, (int)w_v, (int)h_v, 40.0, fps_v);
+    return StereoCamera(fx_v, fy_v, cx_v, cy_v, bl_v, (int)w_v, (int)h_v, 35.0, fps_v);
 }
 
 MapPoint::MapPoint(const Vec3& pos, std::shared_ptr<KeyFrame> ref,
